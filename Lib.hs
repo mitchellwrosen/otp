@@ -1,8 +1,7 @@
-{-# LANGUAGE DataKinds, DeriveAnyClass, DerivingStrategies,
-             ExistentialQuantification, LambdaCase,
-             PatternSynonyms, RankNTypes, RecursiveDo, ScopedTypeVariables,
-             StandaloneDeriving, TypeApplications, TypeOperators,
-             ViewPatterns, UnicodeSyntax #-}
+{-# LANGUAGE BangPatterns, DataKinds, DeriveAnyClass, DerivingStrategies,
+             ExistentialQuantification, LambdaCase, PatternSynonyms,
+             RankNTypes, RecursiveDo, ScopedTypeVariables, StandaloneDeriving,
+             TypeApplications, TypeOperators, UnicodeSyntax #-}
 
 module Lib
   ( Supervisor
@@ -10,15 +9,19 @@ module Lib
   , supervisor
   , transient
   , permanent
+  , SupervisorVanished(..)
+  , MaxRestartIntensityReached(..)
   ) where
 
 import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Exception
+import Control.Monad
 import Data.Function
 import Data.HashMap.Strict (HashMap)
 import Data.IORef
 import Data.Maybe
+import GHC.Clock (getMonotonicTime)
 import Numeric.Natural
 
 import qualified Data.HashMap.Strict as HashMap
@@ -50,6 +53,12 @@ data SupervisorVanished
   = SupervisorVanished !ThreadId
   deriving stock (Show)
   deriving anyclass (Exception)
+
+data MaxRestartIntensityReached
+  = MaxRestartIntensityReached !ThreadId
+  deriving stock (Show)
+  deriving anyclass (Exception)
+
 
 data WorkerType
   = Transient
@@ -128,7 +137,7 @@ supervisor (intensity, period) = do
     forkWorker action = do
       rec
         thread <-
-          -- FIXME
+          -- FIXME unmask timing
           SlaveThread.fork $
             catch
               (do
@@ -138,58 +147,75 @@ supervisor (intensity, period) = do
       pure thread
 
   thread :: ThreadId <-
-    -- FIXME
-    SlaveThread.fork $ (`finally` swapMVar statusVar SupervisorDead) $
+    -- FIXME explain `finally` vs. forkFinally
+    SlaveThread.fork . (`finally` swapMVar statusVar SupervisorDead) $
+      -- FIXME unmask timing
       uninterruptibleMask $ \unmask -> do
+        myThread <- myThreadId
+
         let
           -- The main supervisor loop. Handle mailbox messages one by one, with
           -- asynchronous exceptions masked.
-          loop :: HashMap ThreadId RunningWorkerInfo -> IO ()
-          loop children =
+          loop :: [Double] -> HashMap ThreadId RunningWorkerInfo -> IO ()
+          loop restarts children =
             unmask (atomically (readTQueue mailbox)) >>= \case
               RunWorker ty action threadVar -> do
                 thread <- forkWorker (unmask action)
                 threadRef <- newIORef thread
                 putMVar threadVar (readIORef threadRef)
-                loop $
-                  HashMap.insert
-                    thread
-                    (RunningWorkerInfo ty action threadRef)
-                    children
+                let !children' =
+                      HashMap.insert
+                        thread
+                        (RunningWorkerInfo ty action threadRef)
+                        children
+                loop restarts children'
 
               WorkerThreadDied thread ex ->
                 case fromException ex of
                   Just ThreadKilled ->
-                    loop (HashMap.delete thread children)
+                    loop restarts (HashMap.delete thread children)
 
                   _ -> do
+                    now <- getMonotonicTime
+                    let restarts' = takeWhile (>= (now - period)) (now : restarts)
+                    when (fromIntegral (length restarts') == intensity)
+                      (throwIO (MaxRestartIntensityReached myThread))
+
                     let RunningWorkerInfo ty action threadRef = child thread
                     thread' <- forkWorker (unmask action)
                     writeIORef threadRef thread'
-                    loop $
-                      children
-                        & HashMap.delete thread
-                        & HashMap.insert thread' (RunningWorkerInfo ty action threadRef)
+                    let !children' =
+                          children
+                            & HashMap.delete thread
+                            & HashMap.insert thread' (RunningWorkerInfo ty action threadRef)
+                    loop restarts' children'
 
               WorkerThreadEnded thread ->
                 case child thread of
                   RunningWorkerInfo Permanent action threadRef -> do
+                    now <- getMonotonicTime
+                    let restarts' = takeWhile (>= (now - period)) (now : restarts)
+                    when (fromIntegral (length restarts') == intensity)
+                      (throwIO (MaxRestartIntensityReached myThread))
+
                     thread' <- forkWorker (unmask action)
                     writeIORef threadRef thread'
-                    loop $
-                      children
-                        & HashMap.delete thread
-                        & HashMap.insert thread' (RunningWorkerInfo Permanent action threadRef)
+
+                    let !children' =
+                          children
+                            & HashMap.delete thread
+                            & HashMap.insert thread' (RunningWorkerInfo Permanent action threadRef)
+                    loop restarts' children'
 
                   RunningWorkerInfo Transient _ _ ->
-                    loop (HashMap.delete thread children)
+                    loop restarts (HashMap.delete thread children)
 
             where
               child :: ThreadId -> RunningWorkerInfo
               child thread =
                 fromJust (HashMap.lookup thread children)
 
-        loop mempty
+        loop [] mempty
 
   pure (Supervisor thread statusVar)
 
