@@ -1,0 +1,13 @@
+cabal-version: 2.4
+name: otp
+version: 0
+
+library
+  build-depends:
+      base
+    , named
+    , slave-thread
+    , stm
+    , unordered-containers
+  exposed-modules: Lib
+  ghc-options: -Wall
