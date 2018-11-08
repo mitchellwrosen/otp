@@ -3,6 +3,8 @@
              RankNTypes, RecursiveDo, ScopedTypeVariables, StandaloneDeriving,
              TypeApplications, TypeOperators, UnicodeSyntax #-}
 
+-- TODO race condition: kill thread misses its mark
+
 module Lib
   ( Supervisor
   , supervisorThreadId
@@ -11,6 +13,10 @@ module Lib
   , transient_
   , permanent
   , permanent_
+  , Worker
+  , waitWorker
+  , waitWorkerSTM
+  , cancelWorker
   , SupervisorVanished(..)
   , MaxRestartIntensityReached(..)
   ) where
@@ -23,6 +29,7 @@ import Data.Function
 import Data.HashMap.Strict (HashMap)
 import Data.IORef
 import Data.Maybe
+import Data.Void
 import GHC.Clock (getMonotonicTime)
 import Numeric.Natural
 
@@ -68,6 +75,21 @@ data MaxRestartIntensityReached
   deriving stock (Show)
   deriving anyclass (Exception)
 
+data Worker a
+  = Worker !(IO ThreadId) !(STM a)
+
+waitWorker :: Worker a -> IO a
+waitWorker =
+  atomically . waitWorkerSTM
+
+waitWorkerSTM :: Worker a -> STM a
+waitWorkerSTM (Worker _ result) =
+  result
+
+-- TODO race condition-y!!
+cancelWorker :: Worker a -> IO ()
+cancelWorker (Worker thread _) =
+  killThread =<< thread
 
 data WorkerType
   = Transient
@@ -238,42 +260,35 @@ supervisor (intensity, period) = do
   pure (Supervisor thread statusVar)
 
 -- | Fork a /transient/ worker thread.
-transient :: Supervisor -> IO () -> IO (IO ThreadId)
-transient sup action =
-  spawnWithUnmask Transient sup ($ action)
+transient :: Supervisor -> IO a -> IO (Worker a)
+transient (Supervisor thread statusVar) action =
+  readMVar statusVar >>= \case
+    SupervisorDead ->
+      throwIO (SupervisorVanished thread)
+    SupervisorAlive enqueue -> do
+      resultVar <- newEmptyTMVarIO
+      threadRef <-
+        enqueue Transient $ \unmask -> do
+          result <- unmask action
+          atomically (putTMVar resultVar result)
+      pure (Worker threadRef (readTMVar resultVar))
 
 -- | Fork a /transient/ worker thread.
 transient_ :: Supervisor -> IO () -> IO ()
 transient_ sup action =
-  spawnWithUnmask_ Transient sup ($ action)
+  void (transient sup action)
 
 -- | Fork a /permanent/ worker thread.
-permanent :: Supervisor -> IO () -> IO (IO ThreadId)
-permanent sup action =
-  spawnWithUnmask Permanent sup ($ action)
+permanent :: Supervisor -> IO () -> IO (Worker Void)
+permanent (Supervisor thread statusVar) action =
+  readMVar statusVar >>= \case
+    SupervisorDead ->
+      throwIO (SupervisorVanished thread)
+    SupervisorAlive enqueue -> do
+      threadRef <- enqueue Permanent ($ action)
+      pure (Worker threadRef retry)
 
 -- | Fork a /permanent/ worker thread.
 permanent_ :: Supervisor -> IO () -> IO ()
 permanent_ sup action =
-  spawnWithUnmask_ Permanent sup ($ action)
-
-spawnWithUnmask
-  :: WorkerType
-  -> Supervisor
-  -> ((∀ a. IO a -> IO a) -> IO ())
-  -> IO (IO ThreadId)
-spawnWithUnmask ty (Supervisor thread statusVar) action =
-  readMVar statusVar >>= \case
-    SupervisorDead ->
-      throwIO (SupervisorVanished thread)
-
-    SupervisorAlive enqueue ->
-      enqueue ty action
-
-spawnWithUnmask_
-  :: WorkerType
-  -> Supervisor
-  -> ((∀ a. IO a -> IO a) -> IO ())
-  -> IO ()
-spawnWithUnmask_ ty sup action =
-  void (spawnWithUnmask ty sup action)
+  void (permanent sup action)
