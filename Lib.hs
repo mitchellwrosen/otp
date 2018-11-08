@@ -8,7 +8,9 @@ module Lib
   , supervisorThreadId
   , supervisor
   , transient
+  , transient_
   , permanent
+  , permanent_
   , SupervisorVanished(..)
   , MaxRestartIntensityReached(..)
   ) where
@@ -37,23 +39,30 @@ data Supervisor
 -- a dead supervisor will throw a SupervisorVanished exception.
 data SupervisorStatus
   = SupervisorDead
-  | SupervisorAlive (WorkerType -> IO () -> IO (IO ThreadId))
+  | SupervisorAlive
+      (  WorkerType
+      -> ((∀ a. IO a -> IO a) -> IO ())
+      -> IO (IO ThreadId)
+      )
 
 -- | A 'SupervisorVanished' exception is thrown if you attempt to create a new
 -- child of a dead supervisor.
 --
--- A supervisor can die in three ways:
+-- A supervisor can die in two ways:
 --
 -- * You kill it with 'killThread', in which case it kills all of its children,
 --   runs their finalizers, then ends gracefully.
 --
 -- * Its maximum restart intensity threshold is met, in which case it kills all
---   of its children, runs their finalizers, then throws a '
+--   of its children, runs their finalizers, then throws a
+--   'MaxRestartIntensityReached' exception.
 data SupervisorVanished
   = SupervisorVanished !ThreadId
   deriving stock (Show)
   deriving anyclass (Exception)
 
+-- | A 'MaxRestartIntensityReached' exception is thrown by a supervisor if more
+-- than /intensity/ restarts occur within /period/ seconds.
 data MaxRestartIntensityReached
   = MaxRestartIntensityReached !ThreadId
   deriving stock (Show)
@@ -77,7 +86,7 @@ data Message
   -- the worker fails and is restarted.
   = RunWorker
       !WorkerType
-      !(IO ())
+      !((∀ a. IO a -> IO a) -> IO ())
       !(MVar (IO ThreadId))
 
   -- A worker thread died with some exception.
@@ -99,7 +108,7 @@ data Message
 data RunningWorkerInfo
   = RunningWorkerInfo
       !WorkerType
-      !(IO ())
+      !((∀ a. IO a -> IO a) -> IO ())
       !(IORef ThreadId)
 
 -- | Get a supervisor's thread id.
@@ -109,20 +118,29 @@ supervisorThreadId (Supervisor thread _) =
 
 -- | Fork a supervisor thread with the given /intensity/ and /period/.
 --
--- If any worker is restarted more than /intensity/ times within /period/
--- seconds, all workers are killed, finalized, and the supervisor
-supervisor
-  :: (Natural, Double)
-  -> IO Supervisor
+-- If more than /intensity/ restarts occur within /period/ seconds, all workers
+-- are killed, finalized, and the supervisor throws
+-- 'MaxRestartIntensityReached'.
+--
+-- The purpose of this mechanism is to prevent an infinite loop of crashes and
+-- restarts in case of a misconfiguration or other unrecoverable error.
+--
+-- The smallest acceptable /intensity/ is 1, and /period/ must be positive
+-- (though exceedingly small values offer effectively no protection).
+supervisor :: (Natural, Double) -> IO Supervisor
 supervisor (intensity, period) = do
   mailbox :: TQueue Message <-
     newTQueueIO
 
   statusVar :: MVar SupervisorStatus <-
-    (newMVar . SupervisorAlive) $ \ty action -> do
-      threadVar <- newEmptyMVar
-      atomically (writeTQueue mailbox (RunWorker ty action threadVar))
-      takeMVar threadVar
+    let
+      enqueue :: WorkerType -> ((∀ a. IO a -> IO a) -> IO ()) -> IO (IO ThreadId)
+      enqueue ty action = do
+        threadVar <- newEmptyMVar
+        atomically (writeTQueue mailbox (RunWorker ty action threadVar))
+        takeMVar threadVar
+    in
+      newMVar (SupervisorAlive enqueue)
 
   let
     -- Fork a new worker. It's assumed (required) that this function is called
@@ -160,7 +178,7 @@ supervisor (intensity, period) = do
           loop restarts children =
             unmask (atomically (readTQueue mailbox)) >>= \case
               RunWorker ty action threadVar -> do
-                thread <- forkWorker (unmask action)
+                thread <- forkWorker (action unmask)
                 threadRef <- newIORef thread
                 putMVar threadVar (readIORef threadRef)
                 let !children' =
@@ -182,7 +200,7 @@ supervisor (intensity, period) = do
                       (throwIO (MaxRestartIntensityReached myThread))
 
                     let RunningWorkerInfo ty action threadRef = child thread
-                    thread' <- forkWorker (unmask action)
+                    thread' <- forkWorker (action unmask)
                     writeIORef threadRef thread'
                     let !children' =
                           children
@@ -198,7 +216,7 @@ supervisor (intensity, period) = do
                     when (fromIntegral (length restarts') == intensity)
                       (throwIO (MaxRestartIntensityReached myThread))
 
-                    thread' <- forkWorker (unmask action)
+                    thread' <- forkWorker (action unmask)
                     writeIORef threadRef thread'
 
                     let !children' =
@@ -221,19 +239,41 @@ supervisor (intensity, period) = do
 
 -- | Fork a /transient/ worker thread.
 transient :: Supervisor -> IO () -> IO (IO ThreadId)
-transient =
-  spawn Transient
+transient sup action =
+  spawnWithUnmask Transient sup ($ action)
+
+-- | Fork a /transient/ worker thread.
+transient_ :: Supervisor -> IO () -> IO ()
+transient_ sup action =
+  spawnWithUnmask_ Transient sup ($ action)
 
 -- | Fork a /permanent/ worker thread.
 permanent :: Supervisor -> IO () -> IO (IO ThreadId)
-permanent =
-  spawn Permanent
+permanent sup action =
+  spawnWithUnmask Permanent sup ($ action)
 
-spawn :: WorkerType -> Supervisor -> IO () -> IO (IO ThreadId)
-spawn ty (Supervisor thread statusVar) action =
+-- | Fork a /permanent/ worker thread.
+permanent_ :: Supervisor -> IO () -> IO ()
+permanent_ sup action =
+  spawnWithUnmask_ Permanent sup ($ action)
+
+spawnWithUnmask
+  :: WorkerType
+  -> Supervisor
+  -> ((∀ a. IO a -> IO a) -> IO ())
+  -> IO (IO ThreadId)
+spawnWithUnmask ty (Supervisor thread statusVar) action =
   readMVar statusVar >>= \case
     SupervisorDead ->
       throwIO (SupervisorVanished thread)
 
     SupervisorAlive enqueue ->
       enqueue ty action
+
+spawnWithUnmask_
+  :: WorkerType
+  -> Supervisor
+  -> ((∀ a. IO a -> IO a) -> IO ())
+  -> IO ()
+spawnWithUnmask_ ty sup action =
+  void (spawnWithUnmask ty sup action)
