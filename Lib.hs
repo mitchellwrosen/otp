@@ -1,5 +1,5 @@
 {-# LANGUAGE DataKinds, DeriveAnyClass, DerivingStrategies,
-             ExistentialQuantification, LambdaCase, OverloadedLabels,
+             ExistentialQuantification, LambdaCase,
              PatternSynonyms, RankNTypes, RecursiveDo, ScopedTypeVariables,
              StandaloneDeriving, TypeApplications, TypeOperators,
              ViewPatterns, UnicodeSyntax #-}
@@ -19,7 +19,6 @@ import Data.Function
 import Data.HashMap.Strict (HashMap)
 import Data.IORef
 import Data.Maybe
-import Named
 import Numeric.Natural
 
 import qualified Data.HashMap.Strict as HashMap
@@ -104,10 +103,9 @@ supervisorThreadId (Supervisor thread _) =
 -- If any worker is restarted more than /intensity/ times within /period/
 -- seconds, all workers are killed, finalized, and the supervisor
 supervisor
-  :: "intensity" :! Natural
-  -> "period" :! Double
+  :: (Natural, Double)
   -> IO Supervisor
-supervisor (arg #intensity -> intensity) (arg #period -> period) = do
+supervisor (intensity, period) = do
   mailbox :: TQueue Message <-
     newTQueueIO
 
