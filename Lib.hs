@@ -3,11 +3,11 @@
              RankNTypes, RecursiveDo, ScopedTypeVariables, StandaloneDeriving,
              TypeApplications, TypeOperators, UnicodeSyntax #-}
 
--- TODO race condition: kill thread misses its mark
+-- TODO CancelThread newtype, use this instead of KillThread, do not expose
+-- thread ids
 
 module Lib
   ( Supervisor
-  , supervisorThreadId
   , supervisor
   , transient
   , transient_
@@ -25,10 +25,8 @@ import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
-import Data.Function
 import Data.HashMap.Strict (HashMap)
 import Data.IORef
-import Data.Maybe
 import Data.Void
 import GHC.Clock (getMonotonicTime)
 import Numeric.Natural
@@ -49,8 +47,9 @@ data SupervisorStatus
   | SupervisorAlive
       (  WorkerType
       -> ((∀ a. IO a -> IO a) -> IO ())
-      -> IO (IO ThreadId)
+      -> IO WorkerId
       )
+      (WorkerId -> IO ())
 
 -- | A 'SupervisorVanished' exception is thrown if you attempt to create a new
 -- child of a dead supervisor.
@@ -76,7 +75,13 @@ data MaxRestartIntensityReached
   deriving anyclass (Exception)
 
 data Worker a
-  = Worker !(IO ThreadId) !(STM a)
+  = Worker !(IO ()) !(STM a)
+
+type WorkerId
+  = Int
+
+freshWorkerId :: IO WorkerId
+freshWorkerId = undefined
 
 waitWorker :: Worker a -> IO a
 waitWorker =
@@ -86,10 +91,9 @@ waitWorkerSTM :: Worker a -> STM a
 waitWorkerSTM (Worker _ result) =
   result
 
--- TODO race condition-y!!
 cancelWorker :: Worker a -> IO ()
-cancelWorker (Worker thread _) =
-  killThread =<< thread
+cancelWorker (Worker cancel _) =
+  cancel
 
 data WorkerType
   = Transient
@@ -109,7 +113,10 @@ data Message
   = RunWorker
       !WorkerType
       !((∀ a. IO a -> IO a) -> IO ())
-      !(MVar (IO ThreadId))
+      !(MVar WorkerId)
+
+  | CancelWorker
+      !WorkerId
 
   -- A worker thread died with some exception.
   --
@@ -118,14 +125,14 @@ data Message
   --
   -- Otherwise, restart it (and update its associated IORef ThreadId).
   | WorkerThreadDied
-      ThreadId
+      !WorkerId
       !SomeException
 
   -- A worker thread ended naturally.
   --
   -- If it was a Permanent worker, whoops, it wasn't meant to end. Restart it.
   | WorkerThreadEnded
-      ThreadId
+      !WorkerId
 
 data RunningWorkerInfo
   = RunningWorkerInfo
@@ -156,13 +163,17 @@ supervisor (intensity, period) = do
 
   statusVar :: MVar SupervisorStatus <-
     let
-      enqueue :: WorkerType -> ((∀ a. IO a -> IO a) -> IO ()) -> IO (IO ThreadId)
-      enqueue ty action = do
-        threadVar <- newEmptyMVar
-        atomically (writeTQueue mailbox (RunWorker ty action threadVar))
-        takeMVar threadVar
+      enqueue :: WorkerType -> ((∀ a. IO a -> IO a) -> IO ()) -> IO WorkerId
+      enqueue workerTy action = do
+        workerIdVar <- newEmptyMVar
+        atomically (writeTQueue mailbox (RunWorker workerTy action workerIdVar))
+        takeMVar workerIdVar
+
+      cancel :: WorkerId -> IO ()
+      cancel workerId =
+        atomically (writeTQueue mailbox (CancelWorker workerId))
     in
-      newMVar (SupervisorAlive enqueue)
+      newMVar (SupervisorAlive enqueue cancel)
 
   let
     -- Fork a new worker. It's assumed (required) that this function is called
@@ -173,18 +184,15 @@ supervisor (intensity, period) = do
     -- is written to the supervisor's mailbox. So even though we forked this
     -- thread with "slave-thread" semantics, we won't ever be sniped by its
     -- exceptions.
-    forkWorker :: IO () -> IO ThreadId
-    forkWorker action = do
-      rec
-        thread <-
-          -- FIXME unmask timing
-          SlaveThread.fork $
-            catch
-              (do
-                action
-                atomically (writeTQueue mailbox (WorkerThreadEnded thread)))
-              (atomically . writeTQueue mailbox . WorkerThreadDied thread)
-      pure thread
+    forkWorker :: WorkerId -> IO () -> IO ThreadId
+    forkWorker workerId action = do
+      -- FIXME unmask timing
+      SlaveThread.fork $
+        catch
+          (do
+            action
+            atomically (writeTQueue mailbox (WorkerThreadEnded workerId)))
+          (atomically . writeTQueue mailbox . WorkerThreadDied workerId)
 
   thread :: ThreadId <-
     -- FIXME explain `finally` vs. forkFinally
@@ -196,64 +204,72 @@ supervisor (intensity, period) = do
         let
           -- The main supervisor loop. Handle mailbox messages one by one, with
           -- asynchronous exceptions masked.
-          loop :: [Double] -> HashMap ThreadId RunningWorkerInfo -> IO ()
-          loop restarts children =
+          loop :: [Double] -> HashMap WorkerId RunningWorkerInfo -> IO ()
+          loop restarts !children =
             unmask (atomically (readTQueue mailbox)) >>= \case
-              RunWorker ty action threadVar -> do
-                thread <- forkWorker (action unmask)
+              RunWorker workerTy action workerIdVar -> do
+                workerId <- freshWorkerId
+                thread <- forkWorker workerId (action unmask)
+                putMVar workerIdVar workerId
                 threadRef <- newIORef thread
-                putMVar threadVar (readIORef threadRef)
-                let !children' =
-                      HashMap.insert
-                        thread
-                        (RunningWorkerInfo ty action threadRef)
-                        children
-                loop restarts children'
+                loop
+                  restarts
+                  (HashMap.insert
+                    workerId
+                    (RunningWorkerInfo workerTy action threadRef)
+                    children)
 
-              WorkerThreadDied thread ex ->
+              CancelWorker workerId ->
+                case lookupRunningWorkerInfo workerId of
+                  Nothing ->
+                    pure ()
+
+                  Just (RunningWorkerInfo _ _ threadRef) -> do
+                    killThread =<< readIORef threadRef
+                    loop restarts (HashMap.delete workerId children)
+
+              WorkerThreadDied workerId ex ->
                 case fromException ex of
                   Just ThreadKilled ->
-                    loop restarts (HashMap.delete thread children)
+                    loop restarts (HashMap.delete workerId children)
 
                   _ -> do
                     now <- getMonotonicTime
                     let restarts' = takeWhile (>= (now - period)) (now : restarts)
                     when (fromIntegral (length restarts') == intensity)
                       (throwIO (MaxRestartIntensityReached myThread))
+                    case lookupRunningWorkerInfo workerId of
+                      Nothing ->
+                        pure ()
 
-                    let RunningWorkerInfo ty action threadRef = child thread
-                    thread' <- forkWorker (action unmask)
-                    writeIORef threadRef thread'
-                    let !children' =
-                          children
-                            & HashMap.delete thread
-                            & HashMap.insert thread' (RunningWorkerInfo ty action threadRef)
-                    loop restarts' children'
+                      Just (RunningWorkerInfo _ action threadRef) -> do
+                        threadId <- forkWorker workerId (action unmask)
+                        writeIORef threadRef threadId
+                        loop restarts' children
 
-              WorkerThreadEnded thread ->
-                case child thread of
-                  RunningWorkerInfo Permanent action threadRef -> do
-                    now <- getMonotonicTime
-                    let restarts' = takeWhile (>= (now - period)) (now : restarts)
-                    when (fromIntegral (length restarts') == intensity)
-                      (throwIO (MaxRestartIntensityReached myThread))
+              WorkerThreadEnded workerId ->
+                case lookupRunningWorkerInfo workerId of
+                  Nothing ->
+                    pure ()
 
-                    thread' <- forkWorker (action unmask)
-                    writeIORef threadRef thread'
+                  Just (RunningWorkerInfo workerTy action threadRef) ->
+                    case workerTy of
+                      Permanent -> do
+                        now <- getMonotonicTime
+                        let restarts' = takeWhile (>= (now - period)) (now : restarts)
+                        when (fromIntegral (length restarts') == intensity)
+                          (throwIO (MaxRestartIntensityReached myThread))
+                        threadId <- forkWorker workerId (action unmask)
+                        writeIORef threadRef threadId
+                        loop restarts' children
 
-                    let !children' =
-                          children
-                            & HashMap.delete thread
-                            & HashMap.insert thread' (RunningWorkerInfo Permanent action threadRef)
-                    loop restarts' children'
-
-                  RunningWorkerInfo Transient _ _ ->
-                    loop restarts (HashMap.delete thread children)
+                      Transient ->
+                        loop restarts (HashMap.delete workerId children)
 
             where
-              child :: ThreadId -> RunningWorkerInfo
-              child thread =
-                fromJust (HashMap.lookup thread children)
+              lookupRunningWorkerInfo :: WorkerId -> Maybe RunningWorkerInfo
+              lookupRunningWorkerInfo workerId =
+                HashMap.lookup workerId children
 
         loop [] mempty
 
@@ -265,13 +281,14 @@ transient (Supervisor thread statusVar) action =
   readMVar statusVar >>= \case
     SupervisorDead ->
       throwIO (SupervisorVanished thread)
-    SupervisorAlive enqueue -> do
+
+    SupervisorAlive enqueue cancel -> do
       resultVar <- newEmptyTMVarIO
-      threadRef <-
+      workerId <-
         enqueue Transient $ \unmask -> do
           result <- unmask action
           atomically (putTMVar resultVar result)
-      pure (Worker threadRef (readTMVar resultVar))
+      pure (Worker (cancel workerId) (readTMVar resultVar))
 
 -- | Fork a /transient/ worker thread.
 transient_ :: Supervisor -> IO () -> IO ()
@@ -284,9 +301,10 @@ permanent (Supervisor thread statusVar) action =
   readMVar statusVar >>= \case
     SupervisorDead ->
       throwIO (SupervisorVanished thread)
-    SupervisorAlive enqueue -> do
-      threadRef <- enqueue Permanent ($ action)
-      pure (Worker threadRef retry)
+
+    SupervisorAlive enqueue cancel -> do
+      workerId <- enqueue Permanent ($ action)
+      pure (Worker (cancel workerId) retry)
 
 -- | Fork a /permanent/ worker thread.
 permanent_ :: Supervisor -> IO () -> IO ()
