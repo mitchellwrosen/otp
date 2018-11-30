@@ -9,11 +9,9 @@
 module Lib
   ( Supervisor
   , supervisor
-  , transient
-  , transient_
-  , permanent
-  , permanent_
   , Worker
+  , transient
+  , permanent
   , waitWorker
   , waitWorkerSTM
   , cancelWorker
@@ -27,6 +25,7 @@ import Control.Exception
 import Control.Monad
 import Data.HashMap.Strict (HashMap)
 import Data.IORef
+import Data.Unique
 import Data.Void
 import GHC.Clock (getMonotonicTime)
 import Numeric.Natural
@@ -39,6 +38,7 @@ data Supervisor
   = Supervisor
       !ThreadId
       !(MVar SupervisorStatus)
+  deriving (Eq)
 
 -- The status of the supervisor. It's alive until it's not. Attempting to use
 -- a dead supervisor will throw a SupervisorVanished exception.
@@ -78,10 +78,7 @@ data Worker a
   = Worker !(IO ()) !(STM a)
 
 type WorkerId
-  = Int
-
-freshWorkerId :: IO WorkerId
-freshWorkerId = undefined
+  = Unique
 
 waitWorker :: Worker a -> IO a
 waitWorker =
@@ -208,7 +205,7 @@ supervisor (intensity, period) = do
           loop restarts !children =
             unmask (atomically (readTQueue mailbox)) >>= \case
               RunWorker workerTy action workerIdVar -> do
-                workerId <- freshWorkerId
+                workerId <- newUnique
                 thread <- forkWorker workerId (action unmask)
                 putMVar workerIdVar workerId
                 threadRef <- newIORef thread
@@ -222,7 +219,7 @@ supervisor (intensity, period) = do
               CancelWorker workerId ->
                 case lookupRunningWorkerInfo workerId of
                   Nothing ->
-                    pure ()
+                    loop restarts children
 
                   Just (RunningWorkerInfo _ _ threadRef) -> do
                     killThread =<< readIORef threadRef
@@ -240,7 +237,7 @@ supervisor (intensity, period) = do
                       (throwIO (MaxRestartIntensityReached myThread))
                     case lookupRunningWorkerInfo workerId of
                       Nothing ->
-                        pure ()
+                        loop restarts' children
 
                       Just (RunningWorkerInfo _ action threadRef) -> do
                         threadId <- forkWorker workerId (action unmask)
@@ -250,7 +247,7 @@ supervisor (intensity, period) = do
               WorkerThreadEnded workerId ->
                 case lookupRunningWorkerInfo workerId of
                   Nothing ->
-                    pure ()
+                    loop restarts children
 
                   Just (RunningWorkerInfo workerTy action threadRef) ->
                     case workerTy of
@@ -275,7 +272,7 @@ supervisor (intensity, period) = do
 
   pure (Supervisor thread statusVar)
 
--- | Fork a /transient/ worker thread.
+-- | Fork a transient worker thread.
 transient :: Supervisor -> IO a -> IO (Worker a)
 transient (Supervisor thread statusVar) action =
   readMVar statusVar >>= \case
@@ -290,12 +287,7 @@ transient (Supervisor thread statusVar) action =
           atomically (putTMVar resultVar result)
       pure (Worker (cancel workerId) (readTMVar resultVar))
 
--- | Fork a /transient/ worker thread.
-transient_ :: Supervisor -> IO () -> IO ()
-transient_ sup action =
-  void (transient sup action)
-
--- | Fork a /permanent/ worker thread.
+-- | Fork a permanent worker thread.
 permanent :: Supervisor -> IO () -> IO (Worker Void)
 permanent (Supervisor thread statusVar) action =
   readMVar statusVar >>= \case
@@ -305,8 +297,3 @@ permanent (Supervisor thread statusVar) action =
     SupervisorAlive enqueue cancel -> do
       workerId <- enqueue Permanent ($ action)
       pure (Worker (cancel workerId) retry)
-
--- | Fork a /permanent/ worker thread.
-permanent_ :: Supervisor -> IO () -> IO ()
-permanent_ sup action =
-  void (permanent sup action)

@@ -5,6 +5,7 @@ version: 0
 library
   build-depends:
       base
+    , hashable
     , slave-thread
     , stm
     , unordered-containers
